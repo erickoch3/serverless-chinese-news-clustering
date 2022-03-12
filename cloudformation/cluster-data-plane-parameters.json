@@ -1,0 +1,17 @@
+[{
+        "ParameterKey": "KeyName",
+        "ParameterValue": "eks_admin"
+    },
+    {
+        "ParameterKey": "ControlPlaneStackName",
+        "ParameterValue": "myControlPlane"
+    },
+    {
+        "ParameterKey": "ClusterName",
+        "ParameterValue": "MyEKSCluster"
+    },
+    {
+        "ParameterKey": "NodeGroupName",
+        "ParameterValue": "MyNodeGroup"
+    }
+]

@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Amazon EKS - Node Group
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: EKS Cluster
+        Parameters:
+          - ClusterName
+      - Label:
+          default: Worker Node Configuration
+        Parameters:
+          - NodeGroupName
+          - NodeAutoScalingGroupMinSize
+          - NodeAutoScalingGroupDesiredCapacity
+          - NodeAutoScalingGroupMaxSize
+          - NodeInstanceType
+          - NodeImageIdSSMParam
+          - NodeImageId
+          - NodeVolumeSize
+          - KeyName
+          - BootstrapArguments
+          - DisableIMDSv1
+
+
+Parameters:
+
+  ControlPlaneStackName:
+    Type: String
+    Description: "The stack name of the Control Plane for the Kubernetes Cluster."
+
+  BootstrapArguments:
+    Type: String
+    Default: ""
+    Description: "Arguments to pass to the bootstrap script. See files/bootstrap.sh in https://github.com/awslabs/amazon-eks-ami"
+
+  ClusterName:
+    Type: String
+    Description: The cluster name provided when the cluster was created. If it is incorrect, nodes will not be able to join the cluster.
+
+  KeyName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: The EC2 Key Pair to allow SSH access to the instances
+
+  NodeAutoScalingGroupDesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: Desired capacity of Node Group ASG.
+
+  NodeAutoScalingGroupMaxSize:
+    Type: Number
+    Default: 2
+    Description: Maximum size of Node Group ASG. Set to at least 1 greater than NodeAutoScalingGroupDesiredCapacity.
+
+  NodeAutoScalingGroupMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum size of Node Group ASG.
+
+  NodeGroupName:
+    Type: String
+    Description: Unique identifier for the Node Group.
+
+  NodeImageId:
+    Type: String
+    Default: "ami-07d3e51fccc6786ab"
+    Description: (Optional) Specify your own custom image ID. This value overrides any AWS Systems Manager Parameter Store value specified above.
+
+  NodeImageIdSSMParam:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: /aws/service/eks/optimized-ami/1.14/amazon-linux-2/recommended/image_id
+    Description: AWS Systems Manager Parameter Store parameter of the AMI ID for the worker node instances.
+
+  NodeInstanceType:
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+
+    ConstraintDescription: Must be a valid EC2 instance type
+    Description: EC2 instance type for the node instances
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 20
+    Description: Node volume size
+    
+  DisableIMDSv1:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+
+Mappings:
+  PartitionMap:
+    aws:
+      EC2ServicePrincipal: "ec2.amazonaws.com"
+    aws-us-gov:
+      EC2ServicePrincipal: "ec2.amazonaws.com"
+    aws-cn:
+      EC2ServicePrincipal: "ec2.amazonaws.com.cn"
+    aws-iso:
+      EC2ServicePrincipal: "ec2.c2s.ic.gov"
+    aws-iso-b:
+      EC2ServicePrincipal: "ec2.sc2s.sgov.gov"
+
+Conditions:
+  HasNodeImageId: !Not
+    - "Fn::Equals":
+        - Ref: NodeImageId
+        - ""
+    
+  IMDSv1Disabled:
+    "Fn::Equals":
+      - !Ref DisableIMDSv1
+      - "true"
+
+Resources:
+  NodeInstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !FindInMap [PartitionMap, !Ref "AWS::Partition", EC2ServicePrincipal]
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+      Path: /
+
+  NodeInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles:
+        - !Ref NodeInstanceRole
+
+  NodeSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Security group for all nodes in the cluster
+      Tags:
+        - Key: !Sub kubernetes.io/cluster/${ClusterName}
+          Value: owned
+      VpcId: !ImportValue 
+        'Fn::Sub': '${ControlPlaneStackName}-VpcId'
+
+  NodeSecurityGroupFromControlPlaneIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow pods and worker Kubelets to receive communication from cluster control plane
+      FromPort: 0
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !ImportValue 
+        'Fn::Sub': '${ControlPlaneStackName}-SecurityGroupID'
+      ToPort: 65535
+
+  NodeSecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow node to communicate with each other
+      FromPort: 0
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      ToPort: 65535
+
+  ClusterControlPlaneSecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow pods to communicate with the cluster API Server
+      FromPort: 0
+      GroupId: !ImportValue 
+        'Fn::Sub': '${ControlPlaneStackName}-SecurityGroupID'
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      ToPort: 65535
+
+  ControlPlaneEgressToNodeSecurityGroup:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow the cluster control plane to communicate with worker Kubelet and pods
+      DestinationSecurityGroupId: !Ref NodeSecurityGroup
+      FromPort: 1025
+      GroupId: !ImportValue 
+        'Fn::Sub': '${ControlPlaneStackName}-SecurityGroupID'
+      IpProtocol: tcp
+      ToPort: 65535
+
+  ControlPlaneEgressToNodeSecurityGroupOn443:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow the cluster control plane to communicate with pods running extension API servers on port 443
+      DestinationSecurityGroupId: !Ref NodeSecurityGroup
+      FromPort: 443
+      GroupId: !ImportValue 
+        'Fn::Sub': '${ControlPlaneStackName}-SecurityGroupID'
+      IpProtocol: tcp
+      ToPort: 443
+
+  ### TEMPORARY FOR TESTING!!! ###
+
+  NodeSecurityGroupSSHIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow pods to receive ssh traffic.
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+      IpProtocol: tcp
+      GroupId: !Ref NodeSecurityGroup
+
+  NodeSecurityGroupAllEgress:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow pods to send traffic to any destination.
+      FromPort: 0
+      ToPort: 65535
+      CidrIp: 0.0.0.0/0
+      IpProtocol: tcp
+      GroupId: !Ref NodeSecurityGroup
+  
+  ###
+
+  NodeLaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp2
+        IamInstanceProfile:
+          Name: !Ref NodeInstanceProfile
+        ImageId: !If
+          - HasNodeImageId
+          - !Ref NodeImageId
+          - !Ref NodeImageIdSSMParam
+        InstanceType: !Ref NodeInstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref NodeSecurityGroup
+        UserData: !Base64
+          "Fn::Sub": |
+            #!/bin/bash
+            set -o xtrace
+            /etc/eks/bootstrap.sh ${ClusterName} ${BootstrapArguments}
+            /opt/aws/bin/cfn-signal --exit-code $? \
+                     --stack  ${AWS::StackName} \
+                     --resource NodeGroup  \
+                     --region ${AWS::Region}
+        MetadataOptions:
+          HttpPutResponseHopLimit : 2
+          HttpEndpoint: enabled
+          HttpTokens: !If
+            - IMDSv1Disabled
+            - required
+            - optional
+        
+
+  NodeGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      DesiredCapacity: !Ref NodeAutoScalingGroupDesiredCapacity
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MaxSize: !Ref NodeAutoScalingGroupMaxSize
+      MinSize: !Ref NodeAutoScalingGroupMinSize
+      Tags:
+        - Key: Name
+          PropagateAtLaunch: "true"
+          Value: !Sub ${ClusterName}-${NodeGroupName}-Node
+        - Key: !Sub kubernetes.io/cluster/${ClusterName}
+          PropagateAtLaunch: "true"
+          Value: owned
+      VPCZoneIdentifier: !Split 
+        - "," 
+        - !ImportValue 
+          'Fn::Sub': '${ControlPlaneStackName}-SubnetIds'
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: "1"
+        MinInstancesInService: !Ref NodeAutoScalingGroupDesiredCapacity
+        PauseTime: PT5M
+
+Outputs:
+  NodeInstanceRole:
+    Description: The node instance role
+    Value: !GetAtt NodeInstanceRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-NodeInstanceRoleArn
+
+  NodeSecurityGroup:
+    Description: The security group for the node group
+    Value: !Ref NodeSecurityGroup
+
+  NodeAutoScalingGroup:
+    Description: The autoscaling group
+    Value: !Ref NodeGroup
